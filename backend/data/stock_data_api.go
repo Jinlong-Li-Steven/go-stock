@@ -1744,6 +1744,47 @@ func (receiver StockDataApi) GetCommonKLineData(stockCode string, kLineType stri
 	return K
 }
 
+func (receiver StockDataApi) GetStockNameByCode(stockCode string) string {
+	var stock StockBasic
+	// 优先查询A股
+	tsCode := ""
+	if strings.HasPrefix(stockCode, "sh") {
+		tsCode = strings.Replace(stockCode, "sh", ".SH", 1)
+	} else if strings.HasPrefix(stockCode, "sz") {
+		tsCode = strings.Replace(stockCode, "sz", ".SZ", 1)
+	} else if strings.HasPrefix(stockCode, "bj") {
+		tsCode = strings.Replace(stockCode, "bj", ".BJ", 1)
+	}
+
+	if tsCode != "" {
+		db.Dao.Model(&StockBasic{}).Where("ts_code = ?", tsCode).First(&stock)
+		if stock.Name != "" {
+			return stock.Name
+		}
+	}
+
+	// 查询港股
+	if strings.HasPrefix(stockCode, "hk") {
+		var hkStock models.StockInfoHK
+		db.Dao.Model(&models.StockInfoHK{}).Where("code = ?", strings.ToUpper(stockCode)).First(&hkStock)
+		if hkStock.Name != "" {
+			return hkStock.Name
+		}
+	}
+
+	// 查询美股
+	if strings.HasPrefix(stockCode, "us") || strings.HasPrefix(stockCode, "gb_") {
+		var usStock models.StockInfoUS
+		usCode := strings.ToUpper(strings.Replace(stockCode, "gb_", "us", 1))
+		db.Dao.Model(&models.StockInfoUS{}).Where("code = ?", usCode).First(&usStock)
+		if usStock.Name != "" {
+			return usStock.Name
+		}
+	}
+
+	return stockCode // 如果未找到，返回原始代码
+}
+
 // JSONToMarkdownTable 将JSON数据转换为Markdown表格
 func JSONToMarkdownTable(jsonData []byte) (string, error) {
 	var data []map[string]interface{}

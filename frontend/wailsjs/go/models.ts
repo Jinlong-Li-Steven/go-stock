@@ -7,6 +7,7 @@ export namespace data {
 	    // Go type: time
 	    UpdatedAt: any;
 	    name: string;
+	    apiType: string;
 	    baseUrl: string;
 	    apiKey: string;
 	    modelName: string;
@@ -24,6 +25,7 @@ export namespace data {
 	        this.CreatedAt = this.convertValues(source["CreatedAt"], null);
 	        this.UpdatedAt = this.convertValues(source["UpdatedAt"], null);
 	        this.name = source["name"];
+	        this.apiType = source["apiType"];
 	        this.baseUrl = source["baseUrl"];
 	        this.apiKey = source["apiKey"];
 	        this.modelName = source["modelName"];

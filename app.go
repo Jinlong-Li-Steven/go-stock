@@ -971,20 +971,62 @@ func (a *App) SendDingDingMessageByType(message string, stockCode string, msgTyp
 }
 
 func (a *App) NewChatStream(stock, stockCode, question string, aiConfigId int, sysPromptId *int, enableTools bool) {
-	var msgs <-chan map[string]any
-	if enableTools {
-		msgs = data.NewDeepSeekOpenAi(a.ctx, aiConfigId).NewChatStream(stock, stockCode, question, sysPromptId, a.AiTools)
-	} else {
-		msgs = data.NewDeepSeekOpenAi(a.ctx, aiConfigId).NewChatStream(stock, stockCode, question, sysPromptId, []data.Tool{})
+	config := data.GetSettingConfig()
+	aiConfig, find := slice.FindBy(config.AiConfigs, func(i int, item *data.AIConfig) bool {
+		return item.ID == uint(aiConfigId)
+	})
+
+	if !find {
+		runtime.EventsEmit(a.ctx, "newChatStream", map[string]any{"code": 0, "content": "AI config not found"})
+		runtime.EventsEmit(a.ctx, "newChatStream", "DONE")
+		return
 	}
+
+	var msgs <-chan map[string]any
+	if aiConfig.ApiType == "gemini" {
+		// For Gemini, tools are not supported in the same way. We ignore `enableTools`.
+		msgs = data.NewGeminiApi(a.ctx, aiConfigId).NewGeminiChatStream(stock, stockCode, question, sysPromptId)
+	} else { // Default to openai
+		if enableTools {
+			msgs = data.NewDeepSeekOpenAi(a.ctx, aiConfigId).NewChatStream(stock, stockCode, question, sysPromptId, a.AiTools)
+		} else {
+			msgs = data.NewDeepSeekOpenAi(a.ctx, aiConfigId).NewChatStream(stock, stockCode, question, sysPromptId, []data.Tool{})
+		}
+	}
+
 	for msg := range msgs {
 		runtime.EventsEmit(a.ctx, "newChatStream", msg)
 	}
 	runtime.EventsEmit(a.ctx, "newChatStream", "DONE")
 }
 
+// createStreamHandler creates a channel to handle streaming responses and forward them to the frontend.
+func (a *App) createStreamHandler(eventName string) chan map[string]any {
+	ch := make(chan map[string]any)
+	go func() {
+		for msg := range ch {
+			runtime.EventsEmit(a.ctx, eventName, msg)
+		}
+	}()
+	return ch
+}
+
 func (a *App) SaveAIResponseResult(stockCode, stockName, result, chatId, question string, aiConfigId int) {
-	data.NewDeepSeekOpenAi(a.ctx, aiConfigId).SaveAIResponseResult(stockCode, stockName, result, chatId, question)
+	config := data.GetSettingConfig()
+	aiConfig, find := slice.FindBy(config.AiConfigs, func(i int, item *data.AIConfig) bool {
+		return item.ID == uint(aiConfigId)
+	})
+
+	if !find {
+		// Handle error: config not found
+		return
+	}
+
+	if aiConfig.ApiType == "gemini" {
+		data.NewGeminiApi(a.ctx, aiConfigId).SaveAIResponseResult(stockCode, stockName, result, chatId, question)
+	} else {
+		data.NewDeepSeekOpenAi(a.ctx, aiConfigId).SaveAIResponseResult(stockCode, stockName, result, chatId, question)
+	}
 }
 func (a *App) GetAIResponseResult(stock string) *models.AIResponseResult {
 	return data.NewDeepSeekOpenAi(a.ctx, 0).GetAIResponseResult(stock)
@@ -1304,11 +1346,27 @@ func (a *App) GlobalStockIndexes() map[string]any {
 }
 
 func (a *App) SummaryStockNews(question string, aiConfigId int, sysPromptId *int, enableTools bool) {
+	config := data.GetSettingConfig()
+	aiConfig, find := slice.FindBy(config.AiConfigs, func(i int, item *data.AIConfig) bool {
+		return item.ID == uint(aiConfigId)
+	})
+
+	if !find {
+		runtime.EventsEmit(a.ctx, "summaryStockNews", map[string]any{"code": 0, "content": "AI config not found"})
+		runtime.EventsEmit(a.ctx, "summaryStockNews", "DONE")
+		return
+	}
+
 	var msgs <-chan map[string]any
-	if enableTools {
-		msgs = data.NewDeepSeekOpenAi(a.ctx, aiConfigId).NewSummaryStockNewsStreamWithTools(question, sysPromptId, a.AiTools)
-	} else {
-		msgs = data.NewDeepSeekOpenAi(a.ctx, aiConfigId).NewSummaryStockNewsStream(question, sysPromptId)
+	if aiConfig.ApiType == "gemini" {
+		// For Gemini, tools are not supported in the same way. We ignore `enableTools`.
+		msgs = data.NewGeminiApi(a.ctx, aiConfigId).NewGeminiSummaryStockNewsStream(question, sysPromptId)
+	} else { // Default to openai
+		if enableTools {
+			msgs = data.NewDeepSeekOpenAi(a.ctx, aiConfigId).NewSummaryStockNewsStreamWithTools(question, sysPromptId, a.AiTools)
+		} else {
+			msgs = data.NewDeepSeekOpenAi(a.ctx, aiConfigId).NewSummaryStockNewsStream(question, sysPromptId)
+		}
 	}
 
 	for msg := range msgs {
@@ -1420,4 +1478,214 @@ func (a *App) SaveWordFile(filename string, base64Data string) string {
 //	@return error
 func (a *App) GetAiConfigs() []*data.AIConfig {
 	return data.GetSettingConfig().AiConfigs
+}
+
+func (a *App) StartAIStockScreenerStream(aiConfigId int) {
+	go func() {
+		// Node 1: Data Gathering
+		logger.SugaredLogger.Infof("AI Stock Screener: Starting Data Gathering")
+		runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
+			"node":   "data_gathering",
+			"status": "processing",
+		})
+
+		var newsText strings.Builder
+		// Market News
+		news := data.NewMarketNewsApi().GetNewsList("", 100)
+		for _, telegraph := range *news {
+			newsText.WriteString(fmt.Sprintf("## %s:\n### %s\n", telegraph.Time, telegraph.Content))
+		}
+
+		// Global Stock Indexes
+		indexes := data.NewMarketNewsApi().GlobalStockIndexes(30)
+		indexesText, _ := json.Marshal(indexes)
+		newsText.WriteString("\n\n## Global Stock Indexes:\n")
+		newsText.WriteString(string(indexesText))
+
+		// Industry Rank
+		industryRank := data.NewMarketNewsApi().GetIndustryRank("zdf", 30)
+		industryRankText, _ := json.Marshal(industryRank)
+		newsText.WriteString("\n\n## Industry Rank:\n")
+		newsText.WriteString(string(industryRankText))
+
+		runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
+			"node":    "data_gathering",
+			"status":  "complete",
+			"payload": "数据收集完成",
+		})
+		logger.SugaredLogger.Infof("AI Stock Screener: Data Gathering Complete")
+
+		// Node 2: Event Analysis
+		logger.SugaredLogger.Infof("AI Stock Screener: Starting Event Analysis")
+		runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
+			"node":   "event_analysis",
+			"status": "processing",
+		})
+
+		geminiAPI := data.NewGeminiApi(a.ctx, aiConfigId)
+		prompt1 := `
+			你是一个经验丰富的股票市场分析师. 请根据以下最新的市场新闻、全球股指信息和行业排名数据, 分析并识别出未来几周最有潜力的3-5个行业板块.
+			请说明你选择这些板块的理由, 并为每个板块挑选出1-2只龙头股.
+
+			在完成板块和龙头股分析后，请综合所有信息，从你选出的所有龙头股中，最终筛选出**三支**最具投资潜力的股票。
+
+			你需要考虑的因素包括:
+			- 宏观经济趋势
+			- 近期重大新闻事件的影响
+			- 行业整体表现和资金流向
+			- 市场情绪
+
+			请以Markdown格式返回你的分析结果, 结果应该清晰、简洁, 重点突出.
+			最后，请将最终筛选出的**三支**股票代码以'@@STOCKS:'为前缀单独在一行输出，并以英文逗号分隔，例如：@@STOCKS:sh600036,sz000001,hk00700
+
+			以下是原始数据:
+		 ` + newsText.String()
+		var eventAnalysisResult strings.Builder
+		eventAnalysisCh := geminiAPI.StreamGenerateContent(prompt1)
+		for msg := range eventAnalysisCh {
+			if content, ok := msg["content"].(string); ok {
+				eventAnalysisResult.WriteString(content)
+				runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
+					"node":    "event_analysis",
+					"status":  "streaming",
+					"payload": content,
+				})
+			}
+		}
+
+		runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
+			"node":   "event_analysis",
+			"status": "complete",
+		})
+		logger.SugaredLogger.Infof("AI Stock Screener: Event Analysis Complete")
+
+		// Node 3: Technical Analysis
+		logger.SugaredLogger.Infof("AI Stock Screener: Starting Technical Analysis")
+		runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
+			"node":   "technical_analysis",
+			"status": "processing",
+		})
+
+		// Parse stocks from the previous step
+		var stocksToAnalyze []string
+		lines := strings.Split(eventAnalysisResult.String(), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "@@STOCKS:") {
+				stocksStr := strings.TrimPrefix(line, "@@STOCKS:")
+				stocksToAnalyze = strings.Split(stocksStr, ",")
+				break
+			}
+		}
+		logger.SugaredLogger.Infof("AI Stock Screener: Found stocks to analyze: %v", stocksToAnalyze)
+
+		var techAnalysisResult strings.Builder
+		for _, stockCode := range stocksToAnalyze {
+			stockCode = strings.TrimSpace(stockCode)
+			if stockCode == "" {
+				continue
+			}
+			stockName := data.NewStockDataApi().GetStockNameByCode(stockCode)
+			logger.SugaredLogger.Infof("AI Stock Screener: Analyzing %s (%s)", stockName, stockCode)
+
+			klineData := data.NewStockDataApi().GetCommonKLineData(stockCode, "day", 120)
+			klineText, _ := json.Marshal(klineData)
+
+			prompt2 := `
+				你是一位精通各种技术指标的股票技术分析专家. 请对以下这只股票进行深入的技术分析.
+
+				股票名称: ` + stockName + `
+				股票代码: ` + stockCode + `
+
+				请综合运用以下技术指标进行分析:
+				- **移动平均线 (MA)**: 分析短期、中期、长期均线的排列情况(如金叉、死叉、多头排列、空头排列).
+				- **相对强弱指数 (RSI)**: 判断股票的超买超卖状态.
+				- **MACD 指标**: 分析DIF和DEA线的走势, 以及红绿柱状图的变化.
+				- **布林带 (BOLL)**: 分析股价与上、中、下轨的关系.
+				- **成交量 (Volume)**: 结合股价走势, 分析量价关系.
+
+				请根据你的分析, 给出该股票未来的走势预测, 并明确指出关键的支撑位和阻力位.
+
+				以下是该股票最近120天的日K线数据:
+			` + string(klineText)
+
+			techAnalysisCh := geminiAPI.StreamGenerateContent(prompt2)
+			for msg := range techAnalysisCh {
+				if content, ok := msg["content"].(string); ok {
+					techAnalysisResult.WriteString(content)
+					runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
+						"node":    "technical_analysis",
+						"status":  "streaming",
+						"payload": content,
+					})
+				}
+			}
+			techAnalysisResult.WriteString("\n\n---\n\n")
+		}
+
+		runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
+			"node":   "technical_analysis",
+			"status": "complete",
+		})
+		logger.SugaredLogger.Infof("AI Stock Screener: Technical Analysis Complete")
+
+		// Node 4: Final Report
+		logger.SugaredLogger.Infof("AI Stock Screener: Starting Final Report")
+		runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
+			"node":   "final_report",
+			"status": "processing",
+		})
+
+		prompt3 := `
+			你是一位顶级的投资策略师. 请综合以下的市场板块分析和个股技术分析结果, 为投资者制定一份清晰、可执行的投资策略.
+
+			请**直接**在报告的开头部分，使用以下格式，明确给出最终的投资建议：
+
+			---
+			**核心投资建议**
+
+			*   **股票代码**: [股票代码1], [股票代码2], ...
+			*   **建议买入点位**:
+				*   [股票代码1]: [具体价格区间]
+				*   [股票代码2]: [具体价格区间]
+				*   ...
+			*   **仓位分配**:
+				*   [股票代码1]: [百分比]
+				*   [股票代码2]: [百分比]
+				*   ...
+		---
+
+			然后，在报告的主体部分，请包含以下内容：
+			1.  **投资组合建议**: 详细说明为什么选择这几只股票构成投资组合.
+			2.  **投资逻辑**: 详细阐述推荐这个投资组合的核心逻辑，结合宏观、行业和技术面.
+			3.  **风险提示**: 指出这个投资组合可能面临的主要风险.
+			4.  **总结**: 对整个投资策略进行总结.
+
+			请确保你的报告逻辑清晰, 语言专业, 并以易于理解的Markdown格式呈现.
+
+			以下是分析资料:
+
+			**市场板块分析:**
+			` + eventAnalysisResult.String() + `
+
+			**个股技术分析:**
+			` + techAnalysisResult.String() + `
+		`
+
+		finalReportCh := geminiAPI.StreamGenerateContent(prompt3)
+		for msg := range finalReportCh {
+			if content, ok := msg["content"].(string); ok {
+				runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
+					"node":    "final_report",
+					"status":  "streaming",
+					"payload": content,
+				})
+			}
+		}
+
+		runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
+			"node":   "final_report",
+			"status": "complete",
+		})
+		logger.SugaredLogger.Infof("AI Stock Screener: Final Report Complete")
+	}()
 }

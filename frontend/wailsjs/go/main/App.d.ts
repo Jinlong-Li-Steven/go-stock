@@ -130,6 +130,8 @@ export function SetStockSort(arg1:number,arg2:string):Promise<void>;
 
 export function ShareAnalysis(arg1:string,arg2:string):Promise<string>;
 
+export function StartAIStockScreenerStream(arg1:number):Promise<void>;
+
 export function StockNotice(arg1:string):Promise<Array<any>>;
 
 export function StockResearchReport(arg1:string):Promise<Array<any>>;

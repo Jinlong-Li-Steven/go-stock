@@ -51,6 +51,7 @@ const formValue = ref({
 function addAiConfig() {
   formValue.value.openAI.aiConfigs.push(new data.AIConfig({
     name: '',
+    apiType: 'openai',
     baseUrl: 'https://api.deepseek.com',
     apiKey: '',
     modelName: 'deepseek-chat',
@@ -417,6 +418,9 @@ function deletePrompt(ID) {
                     </n-form-item-gi>
                     <n-form-item-gi :span="12" label="配置名称" :path="`openAI.aiConfigs[${index}].name`">
                       <n-input type="text" placeholder="配置名称" v-model:value="aiConfig.name" clearable/>
+                    </n-form-item-gi>
+                    <n-form-item-gi :span="12" label="接口类型" :path="`openAI.aiConfigs[${index}].apiType`">
+                      <n-select v-model:value="aiConfig.apiType" :options="[{label: 'OpenAI', value: 'openai'}, {label: 'Gemini', value: 'gemini'}]" />
                     </n-form-item-gi>
                     <n-form-item-gi :span="12" label="接口地址" :path="`openAI.aiConfigs[${index}].baseUrl`">
                       <n-input type="text" placeholder="AI接口地址" v-model:value="aiConfig.baseUrl" clearable/>

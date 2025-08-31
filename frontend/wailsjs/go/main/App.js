@@ -254,6 +254,10 @@ export function ShareAnalysis(arg1, arg2) {
   return window['go']['main']['App']['ShareAnalysis'](arg1, arg2);
 }
 
+export function StartAIStockScreenerStream(arg1) {
+  return window['go']['main']['App']['StartAIStockScreenerStream'](arg1);
+}
+
 export function StockNotice(arg1) {
   return window['go']['main']['App']['StockNotice'](arg1);
 }

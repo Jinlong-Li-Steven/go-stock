@@ -46,6 +46,7 @@ type AIConfig struct {
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 	Name        string  `json:"name"`
+	ApiType     string  `json:"apiType"`
 	BaseUrl     string  `json:"baseUrl"`
 	ApiKey      string  `json:"apiKey" `
 	ModelName   string  `json:"modelName"`
@@ -159,6 +160,7 @@ func updateAiConfigs(aiConfigs []*AIConfig) error {
 			notDeleteIds = append(notDeleteIds, item.ID)
 			e = db.Dao.Model(&AIConfig{}).Where("id=?", item.ID).Updates(map[string]interface{}{
 				"name":        item.Name,
+				"api_type":    item.ApiType,
 				"base_url":    item.BaseUrl,
 				"api_key":     item.ApiKey,
 				"model_name":  item.ModelName,

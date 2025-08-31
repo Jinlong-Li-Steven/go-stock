@@ -27,7 +27,7 @@ import {
   StarOutline,
   Wallet, WarningOutline,
 } from '@vicons/ionicons5'
-import {AnalyzeSentiment, GetConfig, GetGroupList,GetVersionInfo} from "../wailsjs/go/main/App";
+import {AnalyzeSentiment, GetConfig, GetGroupList,GetVersionInfo, StartAIStockScreenerStream} from "../wailsjs/go/main/App";
 import {Dragon, Fire, FirefoxBrowser, Gripfire, Robot} from "@vicons/fa";
 import {ReportSearch} from "@vicons/tabler";
 import {LocalFireDepartmentRound} from "@vicons/material";
@@ -448,6 +448,26 @@ const menuOptions = ref([
             RouterLink,
             {
               to: {
+                name: 'ai-screener',
+                query: {
+                  name:"AI选股",
+                },
+                onClick: () => {
+                  activeKey.value = 'ai-screener'
+                },
+              }
+            },
+            {default: () => 'AI选股'}
+        ),
+    key: 'ai-screener',
+    icon: renderIcon(SparklesOutline),
+  },
+  {
+    label: () =>
+        h(
+            RouterLink,
+            {
+              to: {
                 name: 'settings',
                 query: {
                   name:"设置",
@@ -713,50 +733,37 @@ onMounted(() => {
       <n-notification-provider>
         <n-modal-provider>
           <n-dialog-provider>
-            <n-watermark
-                :content="content"
-                cross
-                selectable
-                :font-size="16"
-                :line-height="16"
-                :width="500"
-                :height="400"
-                :x-offset="50"
-                :y-offset="150"
-                :rotate="-15"
-            >
-              <n-flex>
-                <n-grid x-gap="12" :cols="1">
-                  <n-gi>
-                    <n-spin :show="loading">
-                      <template #description>
-                        {{ loadingMsg }}
-                      </template>
-                      <n-marquee :speed="100" style="position: relative;top:0;z-index: 19;width: 100%"
-                                 v-if="(telegraph.length>0)&&(enableNews)">
-                        <n-tag type="warning" v-for="item in telegraph" style="margin-right: 10px">
-                          {{ item }}
-                        </n-tag>
-                      </n-marquee>
-                      <n-scrollbar :style="contentStyle">
-                        <n-skeleton v-if="loading" height="calc(100vh)" />
-                        <RouterView/>
-                      </n-scrollbar>
-                    </n-spin>
-                  </n-gi>
-                  <n-gi style="position: fixed;bottom:0;z-index: 9;width: 100%;">
-                    <n-card size="small" style="--wails-draggable:no-drag">
-                      <n-menu style="font-size: 18px;"
-                              v-model:value="activeKey"
-                              mode="horizontal"
-                              :options="menuOptions"
-                              responsive
-                      />
-                    </n-card>
-                  </n-gi>
-                </n-grid>
-              </n-flex>
-            </n-watermark>
+            <n-flex>
+              <n-grid x-gap="12" :cols="1">
+                <n-gi>
+                  <n-spin :show="loading">
+                    <template #description>
+                      {{ loadingMsg }}
+                    </template>
+                    <n-marquee :speed="100" style="position: relative;top:0;z-index: 19;width: 100%"
+                               v-if="(telegraph.length>0)&&(enableNews)">
+                      <n-tag type="warning" v-for="item in telegraph" style="margin-right: 10px">
+                        {{ item }}
+                      </n-tag>
+                    </n-marquee>
+                    <n-scrollbar :style="contentStyle">
+                      <n-skeleton v-if="loading" height="calc(100vh)" />
+                      <RouterView/>
+                    </n-scrollbar>
+                  </n-spin>
+                </n-gi>
+                <n-gi style="position: fixed;bottom:0;z-index: 9;width: 100%;">
+                  <n-card size="small" style="--wails-draggable:no-drag">
+                    <n-menu style="font-size: 18px;"
+                            v-model:value="activeKey"
+                            mode="horizontal"
+                            :options="menuOptions"
+                            responsive
+                    />
+                  </n-card>
+                </n-gi>
+              </n-grid>
+            </n-flex>
           </n-dialog-provider>
         </n-modal-provider>
       </n-notification-provider>
