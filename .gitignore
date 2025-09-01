@@ -111,3 +111,5 @@ dist
 /build/bin/*
 frontend/package.json.md5
 /build/us.json
+
+llm_analysis
