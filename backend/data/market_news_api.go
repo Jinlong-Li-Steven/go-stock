@@ -99,11 +99,14 @@ func (m MarketNewsApi) GetNewTelegraph(crawlTimeOut int64) *[]models.Telegraph {
 }
 func (m MarketNewsApi) GetNewsList(source string, limit int) *[]*models.Telegraph {
 	news := &[]*models.Telegraph{}
+	query := db.Dao.Model(news).Preload("TelegraphTags").Where("created_at > ?", time.Now().Add(-48*time.Hour))
+
 	if source != "" {
-		db.Dao.Model(news).Preload("TelegraphTags").Where("source=?", source).Order("id desc").Limit(limit).Find(news)
-	} else {
-		db.Dao.Model(news).Preload("TelegraphTags").Order("id desc").Limit(limit).Find(news)
+		query = query.Where("source = ?", source)
 	}
+
+	query.Order("id desc").Limit(limit).Find(news)
+
 	for _, item := range *news {
 		tags := &[]models.Tags{}
 		db.Dao.Model(&models.Tags{}).Where("id in ?", lo.Map(item.TelegraphTags, func(item models.TelegraphTags, index int) uint {
@@ -113,7 +116,6 @@ func (m MarketNewsApi) GetNewsList(source string, limit int) *[]*models.Telegrap
 			return item.Name
 		})
 		item.SubjectTags = tagNames
-		logger.SugaredLogger.Infof("tagNames %v ，SubjectTags：%s", tagNames, item.SubjectTags)
 	}
 	return news
 }
@@ -228,8 +230,19 @@ func (m MarketNewsApi) GlobalStockIndexes(crawlTimeOut uint) map[string]any {
 		Get("https://proxy.finance.qq.com/ifzqgtimg/appstock/app/rank/indexRankDetail2")
 	js := string(response.Body())
 	res := make(map[string]any)
-	json.Unmarshal([]byte(js), &res)
-	return res["data"].(map[string]any)
+	err := json.Unmarshal([]byte(js), &res)
+	if err != nil {
+		logger.SugaredLogger.Errorf("GlobalStockIndexes unmarshal error: %v", err)
+		return make(map[string]any)
+	}
+
+	data, ok := res["data"].(map[string]any)
+	if !ok {
+		logger.SugaredLogger.Warnf("GlobalStockIndexes: 'data' field is not a map[string]any or is nil. Full response: %s", js)
+		return make(map[string]any)
+	}
+
+	return data
 }
 
 func (m MarketNewsApi) GetIndustryRank(sort string, cnt int) map[string]any {

@@ -14,8 +14,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/avast/retry-go"
 	"github.com/duke-git/lancet/v2/cryptor"
 	"github.com/inconshreveable/go-update"
 
@@ -1480,212 +1483,337 @@ func (a *App) GetAiConfigs() []*data.AIConfig {
 	return data.GetSettingConfig().AiConfigs
 }
 
+func (a *App) emitScreenerEvent(flowID int, node, status, payload string) {
+	event := map[string]any{
+		"flow_id": flowID,
+		"node":    node,   // e.g., "data_gathering", "event_analysis"
+		"status":  status, // e.g., "processing", "complete", "error"
+	}
+	if payload != "" {
+		event["payload"] = payload
+	}
+	runtime.EventsEmit(a.ctx, "ai_screener_update", event)
+}
+
 func (a *App) StartAIStockScreenerStream(aiConfigId int) {
-	go func() {
-		// Node 1: Data Gathering
-		logger.SugaredLogger.Infof("AI Stock Screener: Starting Data Gathering")
-		runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
-			"node":   "data_gathering",
-			"status": "processing",
-		})
+	go a.runScreenerOrchestrator(aiConfigId)
+}
 
-		var newsText strings.Builder
-		// Market News
-		news := data.NewMarketNewsApi().GetNewsList("", 100)
-		for _, telegraph := range *news {
-			newsText.WriteString(fmt.Sprintf("## %s:\n### %s\n", telegraph.Time, telegraph.Content))
+// generateContentSync simulates a synchronous call to a streaming API.
+func (a *App) generateContentSync(geminiAPI *data.GeminiApi, prompt string) (string, error) {
+	var result strings.Builder
+	ch := geminiAPI.StreamGenerateContent(prompt)
+	for msg := range ch {
+		if content, ok := msg["content"].(string); ok {
+			result.WriteString(content)
+		}
+		if err, ok := msg["error"].(error); ok {
+			return "", err
+		}
+	}
+	return result.String(), nil
+}
+
+func (a *App) runScreenerOrchestrator(aiConfigId int) {
+	const numFlows = 5
+	const maxRetries = 2
+	analysisTimestamp := time.Now().Format("20060102_150405")
+	baseAnalysisPath := filepath.Join("llm_analysis", analysisTimestamp)
+
+	// Announce the start of the parallel analysis phase
+	runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
+		"node":    "parallel_analysis",
+		"status":  "processing",
+		"message": "正在执行 5 个并行分析流程...",
+	})
+
+	if err := os.MkdirAll(baseAnalysisPath, os.ModePerm); err != nil {
+		logger.SugaredLogger.Errorf("Failed to create base analysis directory: %v", err)
+		runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
+			"node":    "final_report",
+			"status":  "error",
+			"payload": fmt.Sprintf("创建分析目录失败: %v", err),
+		})
+		return
+	}
+
+	var wg sync.WaitGroup
+	resultsChannel := make(chan string, numFlows)
+	var successfulFlows int32
+
+	for i := 1; i <= numFlows; i++ {
+		wg.Add(1)
+		go func(flowID int) {
+			defer wg.Done()
+
+			flowPath := filepath.Join(baseAnalysisPath, fmt.Sprintf("flow_%d", flowID))
+			if err := os.MkdirAll(flowPath, os.ModePerm); err != nil {
+				logger.SugaredLogger.Errorf("[Flow %d] Failed to create flow directory: %v", flowID, err)
+				return
+			}
+
+			var finalResult string
+			err := retry.Do(
+				func() error {
+					var attemptErr error
+					finalResult, attemptErr = a.runSingleScreenerFlow(aiConfigId, flowID, flowPath)
+					return attemptErr
+				},
+				retry.Attempts(maxRetries+1),
+				retry.Delay(time.Second*2),
+				retry.DelayType(retry.BackOffDelay),
+				retry.OnRetry(func(n uint, err error) {
+					logger.SugaredLogger.Warnf("[Flow %d] Retrying... Attempt %d, Error: %v", flowID, n+1, err)
+				}),
+			)
+
+			if err != nil {
+				logger.SugaredLogger.Errorf("[Flow %d] Failed after %d retries: %v", flowID, maxRetries, err)
+				a.emitScreenerEvent(flowID, "flow_status", "error", fmt.Sprintf("流程失败，重试 %d 次后放弃", maxRetries))
+			} else {
+				resultsChannel <- finalResult
+				atomic.AddInt32(&successfulFlows, 1)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(resultsChannel)
+
+	successfulFlowsFinal := atomic.LoadInt32(&successfulFlows)
+	// Announce the completion of the parallel analysis phase
+	runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
+		"node":    "parallel_analysis",
+		"status":  "complete",
+		"payload": fmt.Sprintf("并行分析完成，%d/%d 个流程成功。", successfulFlowsFinal, numFlows),
+	})
+
+	var finalResults []string
+	for result := range resultsChannel {
+		// Basic denoising and deduplication
+		cleanedResult := strings.TrimSpace(result)
+		if cleanedResult != "" && !slice.Contain(finalResults, cleanedResult) {
+			finalResults = append(finalResults, cleanedResult)
+		}
+	}
+
+	if len(finalResults) == 0 {
+		logger.SugaredLogger.Error("All screener flows failed. No results to vote on.")
+		runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
+			"node":    "final_report",
+			"status":  "error",
+			"payload": "所有分析流程均失败，无法生成最终结果。",
+		})
+		return
+	}
+
+	a.performFinalVote(aiConfigId, finalResults, int(successfulFlowsFinal), numFlows, baseAnalysisPath)
+}
+
+func (a *App) runSingleScreenerFlow(aiConfigId, flowID int, flowPath string) (string, error) {
+	// Step 1: Data Gathering
+	a.emitScreenerEvent(flowID, "data_gathering", "processing", "")
+	var newsText strings.Builder
+	news := data.NewMarketNewsApi().GetNewsList("", 500)
+	for _, telegraph := range *news {
+		newsText.WriteString(fmt.Sprintf("## %s:\n### %s\n", telegraph.Time, telegraph.Content))
+	}
+	indexes := data.NewMarketNewsApi().GlobalStockIndexes(30)
+	indexesText, _ := json.Marshal(indexes)
+	newsText.WriteString("\n\n## Global Stock Indexes:\n" + string(indexesText))
+	industryRank := data.NewMarketNewsApi().GetIndustryRank("zdf", 30)
+	industryRankText, _ := json.Marshal(industryRank)
+	newsText.WriteString("\n\n## Industry Rank:\n" + string(industryRankText))
+
+	a.saveStepOutput(flowPath, "step_01_data_gathering.md", newsText.String())
+	a.emitScreenerEvent(flowID, "data_gathering", "complete", "")
+
+	// Step 2: Event Analysis
+	a.emitScreenerEvent(flowID, "event_analysis", "processing", "")
+	geminiAPI := data.NewGeminiApi(a.ctx, aiConfigId)
+	prompt1 := `
+		你是一位经验丰富的股票市场分析师。请根据以下最新的市场新闻、全球股指信息和行业排名数据，执行以下任务：
+		1.  **识别潜力板块**: 分析并识别出未来几周最有潜力的3-5个行业板块。
+		2.  **阐述理由**: 清晰说明你选择这些板块的核心逻辑。
+		3.  **筛选龙头股**: 从每个潜力板块中，挑选出2-3只龙头股。
+		4.  **构建最终股票池**: 综合所有信息，从你选出的所有龙头股中，最终筛选出一个包含最多10支最具投资潜力的股票池。
+		你需要综合考虑宏观经济趋势、重大新闻事件、行业整体表现、资金流向和市场情绪。
+		请以Markdown格式返回你的分析结果, 结果应该清晰、简洁, 重点突出。
+		最后，请将最终筛选出的**所有**股票代码以'@@STOCKS:'为前缀单独在一行输出，并以英文逗号分隔，例如：@@STOCKS:sh600036,sz000001,hk00700
+		以下是原始数据:
+	 ` + newsText.String() + `
+
+	`
+
+	eventAnalysisResult, err := a.generateContentSync(geminiAPI, prompt1)
+	if err != nil {
+		return "", fmt.Errorf("event analysis failed: %w", err)
+	}
+	a.saveStepOutput(flowPath, "step_02_event_analysis.md", eventAnalysisResult)
+	a.emitScreenerEvent(flowID, "event_analysis", "complete", "")
+
+	// Step 3: Technical Analysis
+	a.emitScreenerEvent(flowID, "technical_analysis", "processing", "")
+	var stocksToAnalyze []string
+	lines := strings.Split(eventAnalysisResult, "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "@@STOCKS:") {
+			stocksStr := strings.TrimPrefix(line, "@@STOCKS:")
+			stocksToAnalyze = strings.Split(stocksStr, ",")
+			break
+		}
+	}
+
+	if len(stocksToAnalyze) == 0 {
+		return "", fmt.Errorf("no stocks found from event analysis")
+	}
+
+	var techAnalysisResult strings.Builder
+	for _, stockCode := range stocksToAnalyze {
+		stockCode = strings.TrimSpace(stockCode)
+		if stockCode == "" {
+			continue
+		}
+		stockName := data.NewStockDataApi().GetStockNameByCode(stockCode)
+
+		var klineData *[]data.KLineData
+		if strings.HasPrefix(stockCode, "hk") || strings.HasPrefix(stockCode, "us") || strings.HasPrefix(stockCode, "gb_") {
+			klineData = data.NewStockDataApi().GetHK_KLineData(stockCode, "day", 120)
+		} else if strings.HasPrefix(stockCode, "sh") || strings.HasPrefix(stockCode, "sz") || strings.HasPrefix(stockCode, "bj") {
+			klineData = data.NewStockDataApi().GetCommonKLineData(stockCode, "day", 120)
+		} else {
+			logger.SugaredLogger.Warnf("[Flow %d] Skipping technical analysis for unsupported stock code: %s", flowID, stockCode)
+			continue
 		}
 
-		// Global Stock Indexes
-		indexes := data.NewMarketNewsApi().GlobalStockIndexes(30)
-		indexesText, _ := json.Marshal(indexes)
-		newsText.WriteString("\n\n## Global Stock Indexes:\n")
-		newsText.WriteString(string(indexesText))
-
-		// Industry Rank
-		industryRank := data.NewMarketNewsApi().GetIndustryRank("zdf", 30)
-		industryRankText, _ := json.Marshal(industryRank)
-		newsText.WriteString("\n\n## Industry Rank:\n")
-		newsText.WriteString(string(industryRankText))
-
-		runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
-			"node":    "data_gathering",
-			"status":  "complete",
-			"payload": "数据收集完成",
-		})
-		logger.SugaredLogger.Infof("AI Stock Screener: Data Gathering Complete")
-
-		// Node 2: Event Analysis
-		logger.SugaredLogger.Infof("AI Stock Screener: Starting Event Analysis")
-		runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
-			"node":   "event_analysis",
-			"status": "processing",
-		})
-
-		geminiAPI := data.NewGeminiApi(a.ctx, aiConfigId)
-		prompt1 := `
-			你是一个经验丰富的股票市场分析师. 请根据以下最新的市场新闻、全球股指信息和行业排名数据, 分析并识别出未来几周最有潜力的3-5个行业板块.
-			请说明你选择这些板块的理由, 并为每个板块挑选出1-2只龙头股.
-
-			在完成板块和龙头股分析后，请综合所有信息，从你选出的所有龙头股中，最终筛选出**三支**最具投资潜力的股票。
-
-			你需要考虑的因素包括:
-			- 宏观经济趋势
-			- 近期重大新闻事件的影响
-			- 行业整体表现和资金流向
-			- 市场情绪
-
-			请以Markdown格式返回你的分析结果, 结果应该清晰、简洁, 重点突出.
-			最后，请将最终筛选出的**三支**股票代码以'@@STOCKS:'为前缀单独在一行输出，并以英文逗号分隔，例如：@@STOCKS:sh600036,sz000001,hk00700
-
-			以下是原始数据:
-		 ` + newsText.String()
-		var eventAnalysisResult strings.Builder
-		eventAnalysisCh := geminiAPI.StreamGenerateContent(prompt1)
-		for msg := range eventAnalysisCh {
-			if content, ok := msg["content"].(string); ok {
-				eventAnalysisResult.WriteString(content)
-				runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
-					"node":    "event_analysis",
-					"status":  "streaming",
-					"payload": content,
-				})
-			}
-		}
-
-		runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
-			"node":   "event_analysis",
-			"status": "complete",
-		})
-		logger.SugaredLogger.Infof("AI Stock Screener: Event Analysis Complete")
-
-		// Node 3: Technical Analysis
-		logger.SugaredLogger.Infof("AI Stock Screener: Starting Technical Analysis")
-		runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
-			"node":   "technical_analysis",
-			"status": "processing",
-		})
-
-		// Parse stocks from the previous step
-		var stocksToAnalyze []string
-		lines := strings.Split(eventAnalysisResult.String(), "\n")
-		for _, line := range lines {
-			if strings.HasPrefix(line, "@@STOCKS:") {
-				stocksStr := strings.TrimPrefix(line, "@@STOCKS:")
-				stocksToAnalyze = strings.Split(stocksStr, ",")
-				break
-			}
-		}
-		logger.SugaredLogger.Infof("AI Stock Screener: Found stocks to analyze: %v", stocksToAnalyze)
-
-		var techAnalysisResult strings.Builder
-		for _, stockCode := range stocksToAnalyze {
-			stockCode = strings.TrimSpace(stockCode)
-			if stockCode == "" {
-				continue
-			}
-			stockName := data.NewStockDataApi().GetStockNameByCode(stockCode)
-			logger.SugaredLogger.Infof("AI Stock Screener: Analyzing %s (%s)", stockName, stockCode)
-
-			klineData := data.NewStockDataApi().GetCommonKLineData(stockCode, "day", 120)
-			klineText, _ := json.Marshal(klineData)
-
-			prompt2 := `
-				你是一位精通各种技术指标的股票技术分析专家. 请对以下这只股票进行深入的技术分析.
-
-				股票名称: ` + stockName + `
-				股票代码: ` + stockCode + `
-
-				请综合运用以下技术指标进行分析:
-				- **移动平均线 (MA)**: 分析短期、中期、长期均线的排列情况(如金叉、死叉、多头排列、空头排列).
-				- **相对强弱指数 (RSI)**: 判断股票的超买超卖状态.
-				- **MACD 指标**: 分析DIF和DEA线的走势, 以及红绿柱状图的变化.
-				- **布林带 (BOLL)**: 分析股价与上、中、下轨的关系.
-				- **成交量 (Volume)**: 结合股价走势, 分析量价关系.
-
-				请根据你的分析, 给出该股票未来的走势预测, 并明确指出关键的支撑位和阻力位.
-
-				以下是该股票最近120天的日K线数据:
-			` + string(klineText)
-
-			techAnalysisCh := geminiAPI.StreamGenerateContent(prompt2)
-			for msg := range techAnalysisCh {
-				if content, ok := msg["content"].(string); ok {
-					techAnalysisResult.WriteString(content)
-					runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
-						"node":    "technical_analysis",
-						"status":  "streaming",
-						"payload": content,
-					})
-				}
-			}
-			techAnalysisResult.WriteString("\n\n---\n\n")
-		}
-
-		runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
-			"node":   "technical_analysis",
-			"status": "complete",
-		})
-		logger.SugaredLogger.Infof("AI Stock Screener: Technical Analysis Complete")
-
-		// Node 4: Final Report
-		logger.SugaredLogger.Infof("AI Stock Screener: Starting Final Report")
-		runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
-			"node":   "final_report",
-			"status": "processing",
-		})
-
-		prompt3 := `
-			你是一位顶级的投资策略师. 请综合以下的市场板块分析和个股技术分析结果, 为投资者制定一份清晰、可执行的投资策略.
-
-			请**直接**在报告的开头部分，使用以下格式，明确给出最终的投资建议：
-
-			---
-			**核心投资建议**
-
-			*   **股票代码**: [股票代码1], [股票代码2], ...
-			*   **建议买入点位**:
-				*   [股票代码1]: [具体价格区间]
-				*   [股票代码2]: [具体价格区间]
-				*   ...
-			*   **仓位分配**:
-				*   [股票代码1]: [百分比]
-				*   [股票代码2]: [百分比]
-				*   ...
-		---
-
-			然后，在报告的主体部分，请包含以下内容：
-			1.  **投资组合建议**: 详细说明为什么选择这几只股票构成投资组合.
-			2.  **投资逻辑**: 详细阐述推荐这个投资组合的核心逻辑，结合宏观、行业和技术面.
-			3.  **风险提示**: 指出这个投资组合可能面临的主要风险.
-			4.  **总结**: 对整个投资策略进行总结.
-
-			请确保你的报告逻辑清晰, 语言专业, 并以易于理解的Markdown格式呈现.
-
-			以下是分析资料:
-
-			**市场板块分析:**
-			` + eventAnalysisResult.String() + `
-
-			**个股技术分析:**
-			` + techAnalysisResult.String() + `
+		klineText, _ := json.Marshal(klineData)
+		prompt2 := `
+			你是一位精通各种技术指标且注重风险控制的股票技术分析专家。请对以下股票进行深入的技术分析。
+			股票名称: ` + stockName + `, 股票代码: ` + stockCode + `
+			**分析要求:**
+			1.  **综合技术指标分析**: 运用移动平均线 (MA), 相对强弱指数 (RSI), MACD, 布林带 (BOLL), 和成交量 (Volume) 进行综合分析。
+			2.  **未来走势预测**: 给出该股票未来的短期和中期走势预测。
+			3.  **关键价位**: 明确指出关键的支撑位和阻力位。
+			4.  **风险评估**: 结合当前事件（如果适用）和技术形态，判断当前股价是否处于高位，评估追高的风险。分析是否存在潜在的下跌信号或买入风险。
+			请将你的分析结果清晰地呈现出来。
+			**参考资料:**
+			*   **事件背景**: ` + eventAnalysisResult + `
+			*   **最近120天日K线数据**: ` + string(klineText) + `
 		`
 
-		finalReportCh := geminiAPI.StreamGenerateContent(prompt3)
-		for msg := range finalReportCh {
-			if content, ok := msg["content"].(string); ok {
-				runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
-					"node":    "final_report",
-					"status":  "streaming",
-					"payload": content,
-				})
-			}
+		techAnalysis, err := a.generateContentSync(geminiAPI, prompt2)
+		if err != nil {
+			// Log and continue with other stocks
+			logger.SugaredLogger.Warnf("[Flow %d] Technical analysis for %s failed: %v", flowID, stockCode, err)
+			continue
 		}
+		techAnalysisResult.WriteString(techAnalysis)
+		techAnalysisResult.WriteString("\n\n---\n\n")
+	}
+	a.saveStepOutput(flowPath, "step_03_technical_analysis.md", techAnalysisResult.String())
+	a.emitScreenerEvent(flowID, "technical_analysis", "complete", "")
 
-		runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
-			"node":   "final_report",
-			"status": "complete",
-		})
-		logger.SugaredLogger.Infof("AI Stock Screener: Final Report Complete")
-	}()
+	// Step 4: Final Report for this flow
+	a.emitScreenerEvent(flowID, "final_report_flow", "processing", "")
+	prompt3 := `
+		你是一位顶级的投资策略师. 请综合以下的市场板块分析和个股技术分析结果, 为投资者制定一份清晰、可执行的投资策略. 
+		请**直接**在报告的开头部分，使用以下格式，明确给出最终的投资建议：
+		---
+		**核心投资建议**
+		*   **股票代码**: [股票代码1], [股票代码2], ...
+		---
+		然后，在报告的主体部分，请包含以下内容：
+		1.  **投资组合建议**: 详细说明为什么选择这几只股票构成投资组合. 
+		2.  **投资逻辑**: 详细阐述推荐这个投资组合的核心逻辑，结合宏观、行业和技术面.
+		3.  **风险提示**: 重点整合技术分析中的追高风险和买入风险评估，指出这个投资组合可能面临的主要风险。
+		4.  **总结**: 对整个投资策略进行总结.
+		请确保你的报告逻辑清晰, 语言专业, 并以易于理解的Markdown格式呈现.
+		以下是分析资料:
+		**市场板块分析:**
+		` + eventAnalysisResult + `
+		**个股技术分析:**
+		` + techAnalysisResult.String() + `
+
+	`
+
+	finalReport, err := a.generateContentSync(geminiAPI, prompt3)
+	if err != nil {
+		return "", fmt.Errorf("final report generation failed: %w", err)
+	}
+	a.saveStepOutput(flowPath, "step_04_final_report.md", finalReport)
+	a.emitScreenerEvent(flowID, "final_report_flow", "complete", "")
+
+	return finalReport, nil
+}
+
+func (a *App) performFinalVote(aiConfigId int, finalResults []string, successfulFlows, totalFlows int, baseAnalysisPath string) {
+	logger.SugaredLogger.Infof("Performing final vote with %d successful flows out of %d", successfulFlows, totalFlows)
+	runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
+		"node":    "final_report",
+		"status":  "processing",
+		"payload": "正在进行最终投票...",
+	})
+
+	var allReports strings.Builder
+	for _, report := range finalResults {
+		allReports.WriteString(fmt.Sprintf("---\n%s\n\n", report))
+	}
+
+	votePrompt := fmt.Sprintf(`
+		你是一个资深的投资决策委员会主席。这里有 %d 份由不同分析师团队提供的独立投资分析报告。
+		你的任务是：
+		1.  **审查所有报告**: 仔细阅读每一份报告的核心投资建议。
+		2.  **统计投票**: 统计每只被推荐股票的出现次数。
+		3.  **选出最终股票**: 根据“得票数”从高到低，选出最被看好的几只股票。如果票数相同，则并列保留。
+		4.  **生成最终报告**: 综合所有报告的观点，为最终选出的股票撰写一份总结性的投资报告。报告需要包含：
+		    *   最终推荐的股票列表（代码和名称）。
+			*   最佳买入点位和推荐买入日期
+		    *   选择这些股票的综合理由。
+		    *   潜在的共同风险。
+		    *   一个简短的结论。
+		    *   (重要) 在报告的最后，请附上一个投票统计详情，格式如下：
+		        **投票统计 (有效票数: %d/%d)**
+		        *   [股票代码1] ([股票名称1]): [票数]
+		        *   [股票代码2] ([股票名称2]): [票数]
+		        *   ...
+
+		请以清晰、专业的Markdown格式呈现最终报告。
+
+		以下是 %d 份独立的分析报告：
+		%s
+	`, len(finalResults), successfulFlows, totalFlows, len(finalResults), allReports.String())
+
+	geminiAPI := data.NewGeminiApi(a.ctx, aiConfigId)
+	finalReportCh := geminiAPI.StreamGenerateContent(votePrompt)
+
+	var finalReportBuilder strings.Builder
+	for msg := range finalReportCh {
+		if content, ok := msg["content"].(string); ok {
+			finalReportBuilder.WriteString(content)
+			runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
+				"node":    "final_report",
+				"status":  "streaming",
+				"payload": content,
+			})
+		}
+	}
+
+	finalReport := finalReportBuilder.String()
+	if finalReport != "" {
+		a.saveStepOutput(baseAnalysisPath, "final_report.md", finalReport)
+	}
+
+	runtime.EventsEmit(a.ctx, "ai_screener_update", map[string]any{
+		"node":   "final_report",
+		"status": "complete",
+	})
+	logger.SugaredLogger.Infof("AI Stock Screener: Final Report Complete")
+}
+
+func (a *App) saveStepOutput(flowPath, filename, content string) {
+	filePath := filepath.Join(flowPath, filename)
+	err := os.WriteFile(filePath, []byte(content), 0644)
+	if err != nil {
+		logger.SugaredLogger.Errorf("Failed to save step output to %s: %v", filePath, err)
+	}
 }

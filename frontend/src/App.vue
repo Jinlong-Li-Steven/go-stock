@@ -136,6 +136,28 @@ const menuOptions = ref([
                   to: {
                     name: 'market',
                     query: {
+                      name: "指标选股",
+                    }
+                  },
+                  onClick: () => {
+                    activeKey.value = 'market'
+                    EventsEmit("changeMarketTab", {ID: 0, name: '指标选股'})
+                  },
+                },
+                {default: () => '指标选股',}
+            ),
+        key: 'market11',
+        icon: renderIcon(BoxSearch20Regular),
+      },
+      {
+        label: () =>
+            h(
+                RouterLink,
+                {
+                  href: '#',
+                  to: {
+                    name: 'market',
+                    query: {
                       name: "市场快讯",
                     }
                   },
@@ -356,28 +378,6 @@ const menuOptions = ref([
                   to: {
                     name: 'market',
                     query: {
-                      name: "指标选股",
-                    }
-                  },
-                  onClick: () => {
-                    activeKey.value = 'market'
-                    EventsEmit("changeMarketTab", {ID: 0, name: '指标选股'})
-                  },
-                },
-                {default: () => '指标选股',}
-            ),
-        key: 'market11',
-        icon: renderIcon(BoxSearch20Regular),
-      },
-      {
-        label: () =>
-            h(
-                RouterLink,
-                {
-                  href: '#',
-                  to: {
-                    name: 'market',
-                    query: {
                       name: "名站优选",
                     }
                   },
@@ -422,26 +422,26 @@ const menuOptions = ref([
       },
     ]
   },
-  {
-    label: () =>
-        h(
-            RouterLink,
-            {
-              to: {
-                name: 'agent',
-                query: {
-                  name:"Ai智能体",
-                },
-                onClick: () => {
-                  activeKey.value = 'agent'
-                },
-              }
-            },
-            {default: () => 'Ai智能体'}
-        ),
-    key: 'agent',
-    icon: renderIcon(Robot),
-  },
+  // {
+  //   label: () =>
+  //       h(
+  //           RouterLink,
+  //           {
+  //             to: {
+  //               name: 'agent',
+  //               query: {
+  //                 name:"Ai智能体",
+  //               },
+  //               onClick: () => {
+  //                 activeKey.value = 'agent'
+  //               },
+  //             }
+  //           },
+  //           {default: () => 'Ai智能体'}
+  //       ),
+  //   key: 'agent',
+  //   icon: renderIcon(Robot),
+  // },
   {
     label: () =>
         h(
@@ -482,26 +482,26 @@ const menuOptions = ref([
     key: 'settings',
     icon: renderIcon(SettingsOutline),
   },
-  {
-    label: () =>
-        h(
-            RouterLink,
-            {
-              to: {
-                name: 'about',
-                query: {
-                  name:"关于",
-                }
-              },
-              onClick: () => {
-                activeKey.value = 'about'
-              },
-            },
-            {default: () => '关于'}
-        ),
-    key: 'about',
-    icon: renderIcon(LogoGithub),
-  },
+  // {
+  //   label: () =>
+  //       h(
+  //           RouterLink,
+  //           {
+  //             to: {
+  //               name: 'about',
+  //               query: {
+  //                 name:"关于",
+  //               }
+  //             },
+  //             onClick: () => {
+  //               activeKey.value = 'about'
+  //             },
+  //           },
+  //           {default: () => '关于'}
+  //       ),
+  //   key: 'about',
+  //   icon: renderIcon(LogoGithub),
+  // },
   {
     show:false,
     label: () => h("a", {

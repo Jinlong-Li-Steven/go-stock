@@ -4,138 +4,161 @@
       <n-card title="AI 智能选股工作流" :bordered="false">
         <template #header-extra>
           <n-button @click="startAnalysis" type="primary" :loading="isProcessing" :disabled="isProcessing">
-            开始分析
+            {{ isProcessing ? '分析中...' : '开始分析' }}
           </n-button>
         </template>
 
-        <n-space vertical :size="24">
-          <div v-for="node in workflowNodes" :key="node.id" class="workflow-node">
-            <n-card :title="node.title" size="small">
-              <template #header-extra>
+        <!-- Pipelines Display -->
+        <div class="pipelines-container">
+          <div v-for="pipeline in pipelines" :key="pipeline.id" class="pipeline">
+            <div class="pipeline-header">流水线 {{ pipeline.id }}</div>
+            <div v-for="(node, index) in pipeline.nodes" :key="node.id" class="node-wrapper">
+              <div class="node" :class="['status-' + node.status]">
                 <n-spin v-if="node.status === 'processing'" size="small" />
-                <n-icon v-else-if="node.status === 'complete'" color="green" size="20">
-                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" fill="currentColor"></path></svg>
+                <n-icon v-else size="20" :color="getNodeIconColor(node.status)">
+                  <component :is="getNodeIcon(node.status)" />
                 </n-icon>
-              </template>
-              <div v-if="node.content" class="node-content" v-html="renderMarkdown(node.content)"></div>
-              <n-empty v-else-if="node.status !== 'processing'" description="等待中..." />
-              <div v-else>
-                <n-space vertical>
-                  <n-progress
-                      type="line"
-                      :percentage="node.progress"
-                      :indicator-placement="'inside'"
-                      processing
-                  />
-                  <span>{{ node.message }}</span>
-                </n-space>
+                <span class="node-title">{{ node.title }}</span>
               </div>
-            </n-card>
-            <div v-if="!node.isLast" class="node-connector">
-               <n-icon size="24" :depth="node.status === 'complete' ? 1 : 3">
-                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 4l-1.41 1.41L16.17 11H4v2h12.17l-5.58 5.59L12 20l8-8z" fill="currentColor"></path></svg>
-               </n-icon>
+              <div v-if="index < pipeline.nodes.length - 1" class="connector" :class="{ active: node.status === 'complete' }"></div>
             </div>
           </div>
-        </n-space>
+        </div>
+
+        <!-- Final Report Display -->
+        <n-card title="最终输出" :bordered="true" style="margin-top: 24px;">
+           <div v-if="finalReport.status === 'processing' || finalReport.content" class="final-report-content" v-html="renderMarkdown(finalReport.content)"></div>
+           <n-empty v-else-if="finalReport.status === 'pending'" description="等待所有流水线分析完成..." />
+           <div v-else-if="finalReport.status === 'error'">
+             <n-alert title="生成最终报告时出错" type="error">
+               {{ finalReport.content }}
+             </n-alert>
+           </div>
+        </n-card>
+
       </n-card>
     </div>
   </n-message-provider>
 </template>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount } from 'vue';
+import { ref, onMounted, onBeforeUnmount, h } from 'vue';
 import { EventsOn, EventsOff } from '../../wailsjs/runtime';
-import { StartParallelAnalysis, GetAiConfigs } from '../../wailsjs/go/main/App';
+import { StartAIStockScreenerStream, GetAiConfigs } from '../../wailsjs/go/main/App';
 import { marked } from 'marked';
 import { useMessage } from 'naive-ui';
+import { CheckmarkCircleOutline, CloseCircleOutline, EllipsisHorizontalCircleOutline, HourglassOutline } from '@vicons/ionicons5';
 
 const message = useMessage();
 const isProcessing = ref(false);
+const pipelines = ref([]);
+const finalReport = ref({ status: 'pending', content: '' });
 
-const workflowNodes = ref([
-  { id: 'parallel_analysis', title: '1. 并行分析 (5次)', status: 'pending', content: null, isLast: false, progress: 0, message: '等待启动...' },
-  { id: 'voting', title: '2. 最终投票与决策', status: 'pending', content: null, isLast: true, progress: 0, message: '等待上一步完成...' },
-]);
+const NODE_TITLES = {
+  'data_gathering': '数据收集',
+  'event_analysis': '事件分析',
+  'technical_analysis': '技术分析',
+  'final_report_flow': '生成报告'
+};
 
-const renderMarkdown = (content) => {
-  if (!content) return '';
-  return marked(content);
+const initializePipelines = () => {
+  pipelines.value = Array.from({ length: 5 }, (_, i) => ({
+    id: i + 1,
+    nodes: [
+      { id: 'data_gathering', title: '数据收集', status: 'pending' },
+      { id: 'event_analysis', title: '事件分析', status: 'pending' },
+      { id: 'technical_analysis', title: '技术分析', status: 'pending' },
+      { id: 'final_report_flow', title: '生成报告', status: 'pending' }
+    ]
+  }));
+};
+
+const getNodeIcon = (status) => {
+  switch (status) {
+    case 'complete':
+      return h(CheckmarkCircleOutline);
+    case 'error':
+      return h(CloseCircleOutline);
+    case 'processing':
+       return h(EllipsisHorizontalCircleOutline);
+    default:
+      return h(HourglassOutline);
+  }
+};
+
+const getNodeIconColor = (status) => {
+  switch (status) {
+    case 'complete':
+      return '#63e2b7'; // success color
+    case 'error':
+      return '#e88080'; // error color
+    case 'processing':
+      return '#808080';
+    default:
+      return '#d3d3d3'; // pending color
+  }
 };
 
 const startAnalysis = async () => {
-  // Reset nodes
-  workflowNodes.value.forEach(node => {
-    node.status = 'pending';
-    node.content = null;
-    node.progress = 0;
-  });
-  workflowNodes.value[0].message = '等待启动...';
-  workflowNodes.value[1].message = '等待上一步完成...';
-
+  initializePipelines();
+  finalReport.value = { status: 'pending', content: '' };
   isProcessing.value = true;
-  workflowNodes.value[0].status = 'processing';
-  workflowNodes.value[0].message = '正在初始化并行分析...';
-
 
   try {
     const configs = await GetAiConfigs();
     const geminiConfig = configs.find(c => c.apiType === 'gemini');
 
     if (!geminiConfig) {
-      message.error("未找到可用的 Gemini AI 配置。请先在设置页面添加一个 Gemini 类型的 AI 配置。");
+      message.error("未找到可用的 Gemini AI 配置。");
       isProcessing.value = false;
-      workflowNodes.value[0].status = 'pending';
       return;
     }
     
-    StartParallelAnalysis(geminiConfig.ID);
+    StartAIStockScreenerStream(geminiConfig.ID);
 
   } catch (error) {
     message.error("获取 AI 配置失败: " + error);
     isProcessing.value = false;
-    workflowNodes.value[0].status = 'pending';
   }
 };
 
+const renderMarkdown = (content) => {
+  if (!content) return '';
+  return marked(content);
+};
+
 onMounted(() => {
-  EventsOn('parallel_analysis_update', (update) => {
-    const { node: nodeId, status, payload, progress, message: msg } = update;
-    const targetNode = workflowNodes.value.find(n => n.id === nodeId);
+  initializePipelines(); // Initial setup
+  EventsOn('ai_screener_update', (update) => {
+    const { flow_id, node: nodeId, status, payload } = update;
 
-    if (targetNode) {
-      targetNode.status = status;
-
-      if (progress) {
-        targetNode.progress = progress;
-      }
-      if (msg) {
-        targetNode.message = msg;
-      }
-
+    if (nodeId === 'final_report') {
+      finalReport.value.status = status;
       if (status === 'streaming') {
-        targetNode.status = 'processing'; // Keep it processing while streaming
-        if (targetNode.content === null) {
-          targetNode.content = "";
-        }
-        targetNode.content += payload;
-      } else if (payload) {
-        if (targetNode.content === null) {
-          targetNode.content = "";
-        }
-        targetNode.content += payload;
+        finalReport.value.status = 'processing';
+        finalReport.value.content += payload;
+      } else if (status === 'complete') {
+        isProcessing.value = false;
+      } else if (status === 'error') {
+        finalReport.value.content = payload;
+        isProcessing.value = false;
       }
-
-      if (status === 'complete') {
-        targetNode.progress = 100;
-        const currentIndex = workflowNodes.value.findIndex(n => n.id === nodeId);
-        if (currentIndex + 1 < workflowNodes.value.length) {
-          // Start next node
-          workflowNodes.value[currentIndex + 1].status = 'processing';
-          workflowNodes.value[currentIndex + 1].message = '正在进行最终投票决策...';
+    } else if (flow_id >= 1 && flow_id <= 5) {
+      const pipeline = pipelines.value[flow_id - 1];
+      if (pipeline) {
+        if (nodeId === 'flow_status' && status === 'error') {
+            // Mark all pending nodes in this pipeline as error
+            pipeline.nodes.forEach(node => {
+                if(node.status === 'pending' || node.status === 'processing'){
+                    node.status = 'error';
+                }
+            });
+            message.error(`流水线 ${flow_id} 失败: ${payload}`);
         } else {
-          // This was the last node
-          isProcessing.value = false;
+            const node = pipeline.nodes.find(n => n.id === nodeId);
+            if (node) {
+                node.status = status;
+            }
         }
       }
     }
@@ -143,7 +166,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
-  EventsOff('parallel_analysis_update');
+  EventsOff('ai_screener_update');
 });
 </script>
 
@@ -152,19 +175,76 @@ onBeforeUnmount(() => {
   padding: 20px;
   text-align: left;
 }
-.workflow-node {
-  position: relative;
-}
-.node-connector {
+.pipelines-container {
   display: flex;
-  justify-content: center;
-  align-items: center;
-  height: 50px; /* Space between nodes */
-  transform: rotate(90deg);
+  justify-content: space-around;
+  gap: 20px;
 }
-.node-content {
+.pipeline {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 18%;
+}
+.pipeline-header {
+  font-weight: bold;
+  margin-bottom: 16px;
+}
+.node-wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 100%;
+}
+.node {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  border-radius: 8px;
+  width: 100%;
+  transition: all 0.3s ease;
+  border: 1px solid #ccc;
+}
+.node-title {
+  margin-left: 8px;
+  font-size: 14px;
+}
+.connector {
+  width: 2px;
+  height: 30px;
+  background-color: #ccc;
+  transition: background-color 0.3s ease;
+}
+.connector.active {
+  background-color: #63e2b7;
+}
+
+/* Node Status Styles */
+.status-pending {
+  background-color: #f0f0f0;
+  border-color: #dcdcdc;
+  color: #888;
+}
+.status-processing {
+  background-color: #e6f7ff;
+  border-color: #91d5ff;
+  color: #555;
+}
+.status-complete {
+  background-color: #f6ffed;
+  border-color: #b7eb8f;
+  color: #333;
+}
+.status-error {
+  background-color: #fff1f0;
+  border-color: #ffa39e;
+  color: #d4380d;
+}
+
+.final-report-content {
   white-space: pre-wrap;
   word-wrap: break-word;
+  max-height: 600px;
+  overflow-y: auto;
 }
 </style>
-

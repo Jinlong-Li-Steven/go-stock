@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/PuerkitoBio/goquery v1.10.1
+	github.com/avast/retry-go v3.0.0+incompatible
 	github.com/chromedp/chromedp v0.11.2
 	github.com/cloudwego/eino v0.4.1
 	github.com/cloudwego/eino-ext/components/model/ark v0.1.19

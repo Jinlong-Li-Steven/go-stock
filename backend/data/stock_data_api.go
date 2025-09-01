@@ -1715,28 +1715,41 @@ func (receiver StockDataApi) GetCommonKLineData(stockCode string, kLineType stri
 	if code != 0 {
 		return K
 	}
-	if res["data"] != nil && code == 0 {
-		data := res["data"].(map[string]interface{})[stockCode].(map[string]interface{})
-		if data != nil {
+
+	if res["data"] != nil {
+		dataMap, ok := res["data"].(map[string]interface{})
+		if !ok {
+			logger.SugaredLogger.Warnf("API response 'data' field is not a map for stockCode %s", stockCode)
+			return K
+		}
+
+		stockData, ok := dataMap[stockCode].(map[string]interface{})
+		if !ok {
+			logger.SugaredLogger.Warnf("API response does not contain data for stockCode %s", stockCode)
+			return K
+		}
+
+		if stockData != nil {
 			var day []any
-			if data["qfqday"] != nil {
-				day = data["qfqday"].([]any)
+			if qfqday, ok := stockData["qfqday"].([]any); ok {
+				day = qfqday
+			} else if dayData, ok := stockData["day"].([]any); ok {
+				day = dayData
 			}
-			if data["day"] != nil {
-				day = data["day"].([]any)
-			}
+
 			for _, v := range day {
 				if v != nil {
-					vv := v.([]any)
-					KLine := &KLineData{
-						Day:    convertor.ToString(vv[0]),
-						Open:   convertor.ToString(vv[1]),
-						Close:  convertor.ToString(vv[2]),
-						High:   convertor.ToString(vv[3]),
-						Low:    convertor.ToString(vv[4]),
-						Volume: convertor.ToString(vv[5]),
+					if vv, ok := v.([]any); ok && len(vv) >= 6 {
+						KLine := &KLineData{
+							Day:    convertor.ToString(vv[0]),
+							Open:   convertor.ToString(vv[1]),
+							Close:  convertor.ToString(vv[2]),
+							High:   convertor.ToString(vv[3]),
+							Low:    convertor.ToString(vv[4]),
+							Volume: convertor.ToString(vv[5]),
+						}
+						*K = append(*K, *KLine)
 					}
-					*K = append(*K, *KLine)
 				}
 			}
 		}
